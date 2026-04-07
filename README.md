@@ -1,101 +1,95 @@
-# GENREG_2048
-GENREG attempt to beat 2048
-[FINDINGS.md](https://github.com/user-attachments/files/26524571/FINDINGS.md)
-# GENREG — Consolidated Findings
+[FINDINGS.md](https://github.com/user-attachments/files/26524644/FINDINGS.md)
+# GENREG 2048 — Findings
 
-Experimental results from development and testing of the GENREG neuroevolution framework, April 2026.
+Experimental results from training GENREG on the 2048 game, April 2026.
 
 ---
 
 ## 1. Landscape Design Drives Results
 
-The single most impactful lever in every experiment was the fitness landscape — not the architecture, not the optimizer, not the hyperparameters.
+Every major improvement came from redesigning the fitness signal, not the network or the optimizer.
 
-**Multi-number regression:** The same architecture (256 → 64 → 32 → 1) with the same population (500) and same mutation rate was tested on learning 100 distinct input-output mappings. With summed fitness (broken landscape), 0 of 100 targets were learned. With geometric mean fitness (fixed landscape), 94 of 100 targets were within 1.0 of the correct value. The only change was the fitness function.
+**Proximity bonus direction fix:** The original proximity bonus rewarded 512-tile genomes based on the score threshold for *reaching* 512 (3500). Once a genome scored above 3500, the landscape went flat — no gradient toward 1024. Fixing it to point at the *next* tile's threshold (7000) gave evolution a continuous signal to climb. This single change was necessary (but not sufficient) for reaching 1024.
 
-**CIFAR-10 classification:** Four iterations of landscape design on the same 402K-parameter architecture improved test accuracy from 12.2% to 29.2%. Changes included EMA-smoothed fitness, class-balanced sampling, margin-based scoring, and a mutation rate floor. No architecture modifications.
+**Move cap removal:** Training games were hard-capped at 530 moves. At inference, the best genomes needed 1000+ moves to reach 1024. The model was never allowed to play long enough to discover 1024-level strategies during training. Raising the cap to 3000 unblocked the path.
 
-**2048 training:** Three landscape bugs (checkpoint serialization, move cap, proximity direction) were each individually responsible for preventing the model from reaching 1024. Fixing all three took the system from "never hit 1024 in 43,000 generations" to "1024 at generation 87."
+**Checkpoint serialization bugs:** Three bugs in checkpoint save/load silently destroyed trained state every session:
+1. Per-neuron activation parameters collapsed to scalar (only neuron 0 survived)
+2. Activation function switches didn't reset parameters to the new function's defaults
+3. Save/load didn't persist per-neuron parameter lists
 
-## 2. What GENREG Can and Cannot Learn
+Each created the appearance of a training plateau. The model was rediscovering its peak performance from a collapsed state every session. After fixing all three, progress accumulated across checkpoint cycles.
 
-**Learnable:**
-- 2048 gameplay to 1024 tile level (1,929 parameters, gradient-free)
-- Structured regression with 0.99 test correlation on unseen data
-- XOR parity above random at all bit widths tested (2-64)
-- Constraint satisfaction with zero gradient (6 hard step functions, solved in 2 generations)
-- Discrete multi-step reasoning (count → primality test → conditional branch, 2.5x random baseline)
-- Hash approximation for functions with detectable structure (XOR fold: +2.3 bits)
+## 2. Current Performance
 
-**Not learnable:**
-- SHA-256 or any hash with proper cryptographic diffusion
-- XOR parity above ~57% for bit widths > 4 (representational ceiling, not landscape)
-- 2048 tile in training (reached 1024 but not 2048)
+GENREG V3-V5 with the 1024 config reliably reaches 512 with 70-80% of the population. 1024 tiles appear within a few hundred generations. The population has not yet converged on 1024 consistently — it appears in 2-5% of genomes per generation, and best single-game scores reach 7,000-8,500.
 
-## 3. Evolved Perception (V3)
+2048 has not been reached in training.
 
-Adding an evolved encoder between the raw board signals and the controller produced the largest architectural improvement. The encoder selects from 8 activation functions and tunes their parameters per-genome.
+For comparison, the fully-optimized DQN baseline (938,885 parameters, CNN, action masking, hand-crafted reward shaping) reached a best tile of 1024 with average score 3,636 in the same time budget. GENREG reaches the same best tile with ~1,929 parameters — 487x fewer.
 
-Key observation: after training, the population typically converges on 1-2 activation functions. On the 2048 task, quadratic ReLU dominated (500/500 genomes by generation 250). On other tasks, different activations win. The population discovers the right mathematical lens for the problem.
+## 3. Architecture Is Not the Bottleneck
 
-V3 compressed time to first milestones dramatically compared to V1.
+A controlled sweep tested hidden dimensions of 8, 16, and 32 (2000 generations each, 3 trials):
 
-## 4. Self-Organizing Reproduction (V4)
+| Dims | 1024 count | >=512% | Avg Score | First 1024 |
+|-----:|----------:|-------:|----------:|-----------:|
+| 8 | 14 | 69% | 3,296 | gen 87 |
+| 16 | 14 | 65% | 3,262 | gen 261 |
+| 32 | 5 | 59% | 2,964 | gen 457 |
 
-When genomes are given control over their own mutation parameters, the population self-organizes toward a specific reproductive strategy: low mutation frequency but moderate mutation magnitude, with very low exploration (jump mutation) probability.
+The 1024 plateau is identical across architectures. Bigger networks converge slower. The 1024 config's hidden_size=8 was already optimal.
 
-This means the population prefers "fewer but bigger bets" over "constant small noise." The explore parameter initially drops near zero as exploiters dominate, then partially recovers when rare breakthrough genomes (e.g., those reaching 1024) get ratchet protection and enter the elite pool.
+## 4. Energy Economy Is a Factor
+
+Diagnostic runs showed the best genomes have a ~40% invalid move rate. Each invalid move costs -2 energy. Nearly half the model's energy budget is wasted pressing directions that don't work.
+
+Testing reduced invalid move penalties (0.5, 1.0, 2.0):
+
+| Penalty | >=512% at gen 1000 | 1024 count | First 1024 |
+|--------:|-------------------:|:----------:|:----------:|
+| 2.0 | 69% | 14 | gen 87 |
+| 1.0 | 55% | ~10 | gen 50 |
+| 0.5 | 48% | ~5 | gen 50 |
+
+Lower penalty makes 1024 appear faster but the population doesn't consolidate as well. The original penalty of 2.0 produces the healthiest population overall. The model needs to learn energy efficiency, not be given it for free.
+
+## 5. Evolved Reproduction (V4)
+
+When genomes are given evolvable control over their own mutation parameters (mut_rate, mut_scale, exploration drive), the population self-organizes:
+
+- Mutation rate drops from 0.065 to ~0.016 (fewer mutations per child)
+- Mutation scale stays moderate at ~0.14 (decent-sized mutations when they happen)
+- Exploration drive initially drops to 0.006, then recovers to ~0.03 when 1024 genomes enter the elite pool
+
+The population discovers a strategy of "fewer but bigger bets" rather than constant small noise. Rare explorers that break through to 1024 get ratchet protection, and their higher-exploration traits propagate.
 
 Trust protein parameters (gain, scale, decay) must be excluded from per-genome mutation control. If genomes can control their own trust mutation rate, they evolve to inflate their fitness signal rather than improve gameplay.
 
-## 5. Gradient vs Evolution: The 10-Task Comparison
+## 6. Crossover (V5)
 
-Both gradient descent (Adam) and GENREG were tested on 10 tasks of varying smoothness:
+V5 adds neuron-level crossover between elite parents. The crossover probability is itself an evolvable trait — genomes that benefit from crossover evolve higher rates, those that don't evolve it to zero. Early results show the population self-adjusting crossover rates. Whether crossover helps or hurts over long training runs is still an open question.
 
-| Task | Type | Gradient | GENREG | Winner |
-|------|------|----------|--------|--------|
-| Linear regression | Smooth | -0.71 | -0.03 | GENREG* |
-| Polynomial regression | Smooth | -0.03 | -0.17 | Gradient |
-| 10-class classification | Smooth | 1.00 | 0.88 | Gradient |
-| XOR parity 8-bit | Non-differentiable | 0.55 | 0.62 | GENREG |
-| Sorting 8 numbers | Permutation | 0.46 | 0.31 | Gradient |
-| Modular arithmetic | Non-differentiable | 0.16 | 0.22 | GENREG |
-| Constraint satisfaction | Step functions | 1.00 | 1.00 | Tie** |
-| Discrete reasoning | Non-differentiable | 0.24 | 0.27 | GENREG |
-| Permutation learning | Combinatorial | 0.03 | 0.09 | GENREG |
-| Time series | Semi-smooth | 1.00 | 0.95 | Gradient |
+## 7. Key Bugs Found
 
-*Linear regression result is a compute-budget artifact. **Constraint tie occurred because gradient was given a smooth surrogate loss.
+| Bug | Effect | Fix |
+|-----|--------|-----|
+| Per-neuron params collapsed to scalar on save | Every checkpoint destroyed evolved activation diversity | Save/load all neurons |
+| Activation switch didn't reset params | Genomes had mismatched activation function + parameters | Reset params on switch |
+| save_checkpoint dropped act_params_per_neuron | Load rebuilt per_neuron from wrong activation defaults | Persist in checkpoint |
+| Move cap = starting_energy + 500 | Games killed at 530 moves, 1024 needs 1000+ | Cap at 3000 |
+| Proximity bonus used current tile threshold | No gradient from 512 toward 1024 | Use next tile threshold |
 
-The split is clean: gradient wins on smooth differentiable tasks, GENREG wins on discrete/non-differentiable tasks. Neither is categorically superior.
+**Lesson:** Before diagnosing a plateau as a landscape problem, verify checkpoint round-trips preserve trained behavior.
 
-## 6. The Parity Ceiling Is Representational
+## 8. What's Next
 
-XOR parity was tested with:
-- 8 different landscape designs (all plateau at 54-57%)
-- 9 architecture configurations from 4K to 263K parameters (62x range, 3% accuracy change)
-- 6 bit widths from 2 to 64 (performance plateaus above 4 bits)
-
-The 2-bit case is nearly solved (92%), confirming the architecture CAN represent XOR. The ceiling at higher bit widths is an interaction between the MLP's representational capacity and the combinatorial difficulty of XOR at scale. No landscape redesign or architecture scaling broke through.
-
-## 7. Checkpoint Integrity Matters
-
-Three serialization bugs were discovered that silently destroyed trained state on every save/load cycle:
-
-1. **Per-neuron activation parameters** were collapsed to scalar values (only neuron 0 survived)
-2. **Activation function switches** didn't reset parameters to the new function's defaults
-3. **Save/load** didn't persist per-neuron parameter lists
-
-Each bug created the appearance of a training plateau. The model was continuously rediscovering its peak performance from a collapsed starting state rather than building on previous generations. After fixing all three, training progress accumulated cleanly across checkpoint cycles.
-
-**Lesson:** Before diagnosing a training plateau as a fitness landscape problem, verify that checkpoint round-trips preserve the trained behavior.
-
-## 8. Open Questions
-
-- Can 2048 be reached with the current architecture? The 1024-to-2048 gap may require either more network capacity, a fundamentally different input representation (spatial/CNN), or a multi-stage training approach.
-- Does crossover (V5) help or hurt? Early results show the population self-adjusting crossover rates. Whether it converges to zero (crossover doesn't help) or stabilizes (crossover provides useful genetic diversity) is an open empirical question.
-- Can the trust protein system be validated on tasks with genuine temporal structure? The Find 42 testbed was too simple. Game environments with sustained play (2048, Snake) are where temporal trust should show its advantage, but a controlled comparison against snapshot fitness on those tasks has not been completed.
+The path to 2048 likely requires one or more of:
+- Sustained improvement in move efficiency (reducing the 40% invalid rate)
+- More training time for the population to consolidate at 1024 before pushing higher
+- Possibly spatial awareness in the input encoding (the controller sees a flat vector, not a 2D grid)
+- V5 crossover may provide the genetic diversity needed for the 1024-to-2048 jump — still being evaluated
 
 ---
 
-*Findings documented April 2026. All experiments are reproducible from the code in this repository.*
+*Findings documented April 2026. All experiments reproducible from the code in this repository.*
