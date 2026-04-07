@@ -1,4 +1,4 @@
-[README.md](https://github.com/user-attachments/files/26524715/README.md)
+[README.md](https://github.com/user-attachments/files/26525186/README.md)
 # GENREG 2048 — Gradient-Free Neuroevolution Demo
 
 A gradient-free evolutionary system that learns to play 2048 using trust-based selection, evolved perception, and self-organizing reproductive strategies. No backpropagation. No gradients. No reward shaping. Just evolution.
